@@ -1,0 +1,83 @@
+name: Android APK
+
+# Cada push a main compila un APK firmado.
+# Cada tag vX.Y.Z publica un Release descargable desde el celular.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PRENZAO_VERSION_CODE: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Versión
+        run: |
+          BASE=$(node -p "require('./package.json').version")
+          echo "PRENZAO_VERSION_NAME=${BASE}+${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
+
+      - name: Dependencias
+        run: npm ci
+
+      - name: Typecheck + build web
+        run: npm run build
+
+      - name: Sincronizar Capacitor
+        run: npx cap sync android
+
+      - name: Llave de firma (secreto PRENZAO_SIGNING)
+        env:
+          PRENZAO_SIGNING: ${{ secrets.PRENZAO_SIGNING }}
+        run: |
+          if [ -z "$PRENZAO_SIGNING" ]; then
+            echo "::error::Falta el secreto PRENZAO_SIGNING. Sin él, el APK no se puede instalar encima de la versión actual. Ver README → 'Firma'."
+            exit 1
+          fi
+          mkdir -p $RUNNER_TEMP/sign
+          echo "$PRENZAO_SIGNING" | base64 -d | tar xz -C $RUNNER_TEMP/sign
+          cat $RUNNER_TEMP/sign/signing.env >> $GITHUB_ENV
+          echo "PRENZAO_KEYSTORE_PATH=$RUNNER_TEMP/sign/prenzao-release.jks" >> $GITHUB_ENV
+
+      - name: Compilar APK firmado
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+          mv app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/Prenzao-${PRENZAO_VERSION_NAME}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Prenzao-${{ env.PRENZAO_VERSION_NAME }}
+          path: Prenzao-*.apk
+          retention-days: 30
+
+      - name: Publicar Release (solo tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Prenzao-*.apk
+          generate_release_notes: true

@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Prenzao</string>
+    <string name="title_activity_main">Prenzao</string>
+    <string name="package_name">co.prenzao.app</string>
+    <string name="custom_url_scheme">co.prenzao.app</string>
+</resources>
