@@ -7,3 +7,5 @@ android/local.properties
 android/app/build
 android/build
 android/.gradle
+*.jsonl
+relay/node_modules

@@ -1,402 +1,322 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { Bike, Check, ChevronRight, Minus, Plus, Store, StickyNote, MessageCircle, Search, X } from 'lucide-react';
 import { db } from '../lib/db';
-import { CATEGORY_ORDER } from '../data/menu';
-import { money, onlyDigits, plural } from '../lib/format';
-import { createOrder, whatsappStatusText } from '../lib/orders';
+import { CATEGORY_COLOR, CATEGORY_ORDER } from '../data/menu';
+import { money } from '../lib/format';
+import { createOrder, customerMessage } from '../lib/orders';
 import { haptic, openWhatsApp } from '../lib/platform';
-import { useSettings } from '../lib/hooks';
-import type { Channel, Order, OrderItem, PayMethod, PayStatus, Product } from '../lib/types';
-import { Chips, Field, MoneyInput, Segmented, Sheet, toast } from '../components/ui';
+import { sfx } from '../lib/sound';
+import { useBusiness, useMe, useTodayKey, useTodayOrders, useTopProducts } from '../lib/hooks';
+import type { Channel, OrderItem, Product } from '../lib/types';
+import { Ring, Sheet, Stepper, toast } from '../ui/kit';
+import { burst, celebrate } from '../ui/celebrate';
+import { CashSheet, TransferSheet } from '../ui/pay';
+import { CustomerSheet, emptyCustomer, type CustomerDraft } from '../ui/order';
 
-export const CAT_COLOR: Record<string, string> = {
-  Prenzao: '#F25C05',
-  'Sándwich': '#D99A00',
-  Hamburguesa: '#B4461B',
-  'Hot Dog': '#E0352B',
-  'Patacón': '#4E9A1B',
-  Especial: '#7A4FE0',
-};
-
-export interface CartState {
+export interface Cart {
   channel: Channel;
   items: OrderItem[];
+  customer: CustomerDraft;
 }
+export const emptyCart = (channel: Channel = 'mostrador'): Cart => ({ channel, items: [], customer: emptyCustomer() });
 
-const QUICK_NOTES = ['Sin cebolla', 'Sin salsas', 'Sin lechuga', 'Sin tomate', 'Salsas aparte', 'Para llevar'];
+const QUICK_NOTES = ['Sin cebolla', 'Sin salsas', 'Sin lechuga', 'Sin tomate', 'Salsas aparte', 'Bien tostado', 'Extra salsa de ajo'];
 
-export function Vender({ cart, setCart }: { cart: CartState; setCart: (c: CartState) => void }) {
-  const products = useLiveQuery(() => db.products.orderBy('sort').toArray(), []) ?? [];
-  const [cat, setCat] = useState<string>('Todo');
-  const [query, setQuery] = useState('');
-  const [searching, setSearching] = useState(false);
-  const [checkout, setCheckout] = useState(false);
-  const [done, setDone] = useState<Order | null>(null);
+export function Vender({ cart, setCart, onPaste }: { cart: Cart; setCart: (c: Cart) => void; onPaste: () => void }) {
+  const biz = useBusiness();
+  const me = useMe();
+  const day = useTodayKey();
+  const today = useTodayOrders(day);
+  const products = useLiveQuery(() => db.products.toArray(), []) ?? [];
+  const topIds = useTopProducts(8);
+  const [cat, setCat] = useState<string | null>(null);
+  const [noteFor, setNoteFor] = useState<Product | null>(null);
+  const [step, setStep] = useState<null | 'cash' | 'transfer' | 'customer'>(null);
+  const [bump, setBump] = useState<string | null>(null);
+  const dockRef = useRef<HTMLDivElement>(null);
 
-  const cats = useMemo(() => {
-    const present = new Set(products.filter((p) => p.active).map((p) => p.category));
-    return ['Todo', ...CATEGORY_ORDER.filter((c) => present.has(c)), ...[...present].filter((c) => !CATEGORY_ORDER.includes(c))];
-  }, [products]);
+  const active = products.filter((p) => p.active && !p.deleted);
+  const cats = CATEGORY_ORDER.filter((c) => active.some((p) => p.category === c)).concat([...new Set(active.map((p) => p.category))].filter((c) => !CATEGORY_ORDER.includes(c)));
+  const byCat = (c: string) => active.filter((p) => p.category === c).sort((a, b) => a.sort - b.sort);
+  const top = topIds.map((id) => active.find((p) => p.id === id)).filter(Boolean) as Product[];
+  const isDom = cart.channel === 'domicilio';
 
-  const visible = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return products
-      .filter((p) => p.active)
-      .filter((p) => (cat === 'Todo' ? true : p.category === cat))
-      .filter((p) => (q ? (p.name + ' ' + p.description).toLowerCase().includes(q) : true))
-      .sort((a, b) => CATEGORY_ORDER.indexOf(a.category) - CATEGORY_ORDER.indexOf(b.category) || a.sort - b.sort);
-  }, [products, cat, query]);
+  const sales = today.filter((o) => o.status !== 'cancelado').reduce((a, o) => a + o.total, 0);
+  const goal = biz.dailyGoal || 1;
+  const progress = sales / goal;
+  const nextNum = today.reduce((m, o) => Math.max(m, o.number), 0) + 1;
 
-  const qtyOf = (id: string) => cart.items.filter((i) => i.productId === id).reduce((a, i) => a + i.qty, 0);
+  const qty = (id: string) => cart.items.filter((i) => i.productId === id).reduce((a, i) => a + i.qty, 0);
   const count = cart.items.reduce((a, i) => a + i.qty, 0);
   const subtotal = cart.items.reduce((a, i) => a + i.qty * i.price, 0);
+  const fee = isDom ? cart.customer.fee ?? biz.defaultDeliveryFee : 0;
+  const total = subtotal + fee;
 
-  const add = (p: Product) => {
-    if (p.soldOut) return;
+  // metas del día: celebrar 50% y 100% una sola vez
+  useEffect(() => {
+    if (!biz.dailyGoal) return;
+    for (const m of [0.5, 1]) {
+      const key = `goal:${day}:${m}`;
+      if (progress >= m && !localStorage.getItem(key)) {
+        localStorage.setItem(key, '1');
+        setTimeout(() => celebrate({ title: m === 1 ? '¡Meta cumplida!' : '¡Mitad de la meta!', sub: `${money(sales)} vendidos hoy`, big: true, icon: m === 1 ? '🏆' : '🔥' }), 1600);
+      }
+    }
+  }, [progress >= 0.5, progress >= 1]);
+
+  const fly = (e: React.MouseEvent, emoji: string) => {
+    const dock = dockRef.current?.getBoundingClientRect();
+    const tx = dock ? dock.left + dock.width - 60 : window.innerWidth - 60;
+    const ty = dock ? dock.top + 24 : window.innerHeight - 200;
+    const el = document.createElement('div');
+    el.className = 'fly';
+    el.textContent = emoji;
+    el.style.left = `${e.clientX}px`;
+    el.style.top = `${e.clientY}px`;
+    el.style.setProperty('--dx', `${tx - e.clientX}px`);
+    el.style.setProperty('--dy', `${ty - e.clientY}px`);
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 600);
+  };
+
+  const add = (p: Product, e?: React.MouseEvent, note?: string, n = 1) => {
+    if (p.soldOut) return toast(`${p.name} está agotado`, 'warn');
     haptic.tap();
-    const idx = cart.items.findIndex((i) => i.productId === p.id && !i.note);
+    sfx.pop(qty(p.id) + 1);
+    if (e) fly(e, p.emoji ?? '🍽️');
     const items = [...cart.items];
-    if (idx >= 0) items[idx] = { ...items[idx], qty: items[idx].qty + 1 };
-    else items.push({ productId: p.id, name: p.name, price: p.price, qty: 1 });
+    const i = items.findIndex((x) => x.productId === p.id && (x.note ?? '') === (note ?? ''));
+    if (i >= 0) items[i] = { ...items[i], qty: items[i].qty + n };
+    else items.push({ productId: p.id, name: p.name, price: p.price, qty: n, note });
+    setCart({ ...cart, items });
+    setBump(p.id);
+    setTimeout(() => setBump(null), 320);
+  };
+
+  const removeOne = (productId: string, note?: string) => {
+    haptic.tap();
+    sfx.remove();
+    const items = [...cart.items];
+    let i = items.findIndex((x) => x.productId === productId && (note === undefined || (x.note ?? '') === (note ?? '')));
+    if (i < 0) i = items.map((x) => x.productId).lastIndexOf(productId);
+    if (i < 0) return;
+    if (items[i].qty > 1) items[i] = { ...items[i], qty: items[i].qty - 1 };
+    else items.splice(i, 1);
     setCart({ ...cart, items });
   };
-  const removeOne = (p: Product) => {
-    haptic.tap();
-    const items = [...cart.items];
-    // quita primero de la línea sin nota, si no de la última
-    let idx = items.findIndex((i) => i.productId === p.id && !i.note);
-    if (idx < 0) idx = items.map((i) => i.productId).lastIndexOf(p.id);
-    if (idx < 0) return;
-    if (items[idx].qty > 1) items[idx] = { ...items[idx], qty: items[idx].qty - 1 };
-    else items.splice(idx, 1);
-    setCart({ ...cart, items });
+
+  // pulsación larga → nota
+  const press = useRef<{ t: ReturnType<typeof setTimeout> | null; long: boolean }>({ t: null, long: false });
+  const tileHandlers = (p: Product) => ({
+    onPointerDown: () => {
+      press.current.long = false;
+      press.current.t = setTimeout(() => {
+        press.current.long = true;
+        haptic.medium();
+        setNoteFor(p);
+      }, 480);
+    },
+    onPointerUp: () => press.current.t && clearTimeout(press.current.t),
+    onPointerLeave: () => press.current.t && clearTimeout(press.current.t),
+    onClick: (e: React.MouseEvent) => {
+      if (press.current.long) return;
+      add(p, e);
+    },
+  });
+
+  const finish = async (payStatus: 'pagado' | 'pendiente', method?: 'efectivo' | 'transferencia', account?: string, received?: number) => {
+    setStep(null);
+    const c = cart.customer;
+    const o = await createOrder({
+      channel: cart.channel,
+      items: cart.items,
+      deliveryFee: fee,
+      payStatus,
+      payMethod: method,
+      payAccount: account,
+      cashReceived: received,
+      customer: isDom || c.name ? { name: c.name || undefined, phone: c.phone.replace(/\D/g, '') || undefined, address: c.address || undefined, urgent: c.urgent || undefined } : undefined,
+    });
+    setCart(emptyCart(cart.channel));
+    const change = received && received > o.total ? received - o.total : 0;
+    celebrate({
+      title: `#${o.number}`,
+      sub: payStatus === 'pagado' ? `${money(o.total)} cobrado · ¡a la cocina! 🔥` : `En cocina · ${money(o.total)} por cobrar`,
+      stay: isDom,
+      extra: (
+        <>
+          {change > 0 && <div className="change-box"><div style={{ fontWeight: 750 }}>Devuelve</div><div className="v">{money(change)}</div></div>}
+          {isDom && <button className="btn btn-wa btn-block btn-xl" onClick={() => openWhatsApp(o.customer?.phone, customerMessage(o, biz.name))}>💬 Confirmar al cliente</button>}
+        </>
+      ),
+    });
+    if (payStatus === 'pendiente' && !isDom) sfx.done();
   };
+
+  const needCustomer = isDom && cart.customer.address.trim().length < 4;
+  const go = (what: 'cash' | 'transfer' | 'later') => {
+    haptic.medium();
+    if (needCustomer) return setStep('customer');
+    if (what === 'later' || (isDom && what === 'cash')) return finish('pendiente', isDom ? 'efectivo' : undefined);
+    setStep(what);
+  };
+
+  // scroll-spy de categorías
+  useEffect(() => {
+    const obs = new IntersectionObserver(
+      (entries) => {
+        const vis = entries.filter((e) => e.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0];
+        if (vis) setCat((vis.target as HTMLElement).dataset.cat ?? null);
+      },
+      { rootMargin: '-140px 0px -60% 0px' },
+    );
+    document.querySelectorAll('.menu-sec').forEach((el) => obs.observe(el));
+    return () => obs.disconnect();
+  }, [cats.join()]);
+
+  const jump = (c: string) => {
+    haptic.tap();
+    setCat(c);
+    document.getElementById(`sec-${c}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  const greeting = useMemo(() => {
+    const h = new Date().getHours();
+    return h < 12 ? 'Buenos días' : h < 19 ? 'Buenas tardes' : 'Buenas noches';
+  }, []);
 
   return (
-    <div className="screen">
-      <header className="large-head">
-        <div className="large-head-row">
-          <div>
-            <div className="eyebrow">Nueva venta</div>
-            <h1 className="large-title">Vender</h1>
-          </div>
-          <button className={`icon-btn round ${searching ? 'on' : ''}`} aria-label="Buscar" onClick={() => { setSearching(!searching); setQuery(''); }}>
-            {searching ? <X size={18} /> : <Search size={18} />}
-          </button>
+    <div className="page" style={{ paddingTop: 0 }}>
+      <div className="hello">
+        <div className="grow">
+          <div className="hello-title">{greeting}{me ? `, ${me.name.split(' ')[0]}` : ''} {me?.emoji ?? '👋'}</div>
+          <div className="hello-sub">Siguiente pedido <b style={{ color: 'var(--ink)' }}>#{nextNum}</b> · hoy {money(sales)}</div>
         </div>
-        <Segmented<Channel>
-          size="lg"
-          value={cart.channel}
-          onChange={(channel) => setCart({ ...cart, channel })}
-          options={[
-            { value: 'mostrador', label: <span className="seg-ico"><Store size={16} /> Mostrador</span> },
-            { value: 'domicilio', label: <span className="seg-ico"><Bike size={16} /> Domicilio</span> },
-          ]}
-        />
-        {searching && (
-          <input className="input search" autoFocus placeholder="Buscar producto o ingrediente…" value={query} onChange={(e) => setQuery(e.target.value)} />
+        {biz.dailyGoal > 0 && (
+          <Ring value={progress} size={62} stroke={7} track="rgba(60,40,20,.1)">
+            <span className="ring-lbl">{Math.min(999, Math.round(progress * 100))}%</span>
+          </Ring>
         )}
-      </header>
+      </div>
 
-      <div className="cat-bar">
+      <button className="wa-cta pressable" onClick={onPaste}>
+        <span className="wa-cta-ico">💬</span>
+        <span className="grow"><b>Pedido de WhatsApp</b><small>Copia el mensaje del cliente y toca aquí</small></span>
+        <span style={{ fontSize: 20 }}>›</span>
+      </button>
+
+      {top.length >= 3 && (
+        <>
+          <div className="sec"><h3>Lo que más sale</h3><span>toca = agregar</span></div>
+          <div className="top-row">
+            {top.map((p, i) => (
+              <button key={p.id} className={`top-tile ${qty(p.id) ? 'has' : ''}`} {...tileHandlers(p)}>
+                <span className="rank">{i + 1}</span>
+                <span className="emoji">{p.emoji}</span>
+                <span className="t-name">{p.name}</span>
+                <span className="t-price">{money(p.price)}</span>
+                {qty(p.id) > 0 && <span className={`qty-badge ${bump === p.id ? 'bump' : ''}`} style={{ top: 'auto', bottom: 10 }}>{qty(p.id)}</span>}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      <div className="cats">
         {cats.map((c) => (
-          <button
-            key={c}
-            className={`cat-chip ${cat === c ? 'on' : ''}`}
-            style={c !== 'Todo' ? { ['--c' as string]: CAT_COLOR[c] ?? '#8E8E93' } : undefined}
-            onClick={() => { haptic.tap(); setCat(c); }}
-          >
-            {c !== 'Todo' && <i className="dot" />}
-            {c}
+          <button key={c} className={`cat ${cat === c ? 'on' : ''}`} onClick={() => jump(c)}>
+            <span className="e">{byCat(c)[0]?.emoji}</span>{c}
           </button>
         ))}
       </div>
 
-      <div className="product-grid">
-        {visible.map((p) => {
-          const q = qtyOf(p.id);
-          return (
-            <div key={p.id} className={`product ${q ? 'in-cart' : ''} ${p.soldOut ? 'sold-out' : ''}`} style={{ ['--c' as string]: CAT_COLOR[p.category] ?? '#8E8E93' }}>
-              <button className="product-hit" onClick={() => add(p)} disabled={p.soldOut} aria-label={`Agregar ${p.name}`}>
-                <span className="product-cat"><i className="dot" />{p.category}</span>
-                <span className="product-name">{p.name}</span>
-                <span className="product-desc">{p.description}</span>
-                <span className="product-price">{p.soldOut ? 'Agotado' : money(p.price)}</span>
-              </button>
-              {q > 0 && (
-                <div className="product-qty">
-                  <button aria-label="Quitar uno" onClick={() => removeOne(p)}><Minus size={16} strokeWidth={2.6} /></button>
-                  <span>{q}</span>
-                  <button aria-label="Agregar uno" onClick={() => add(p)}><Plus size={16} strokeWidth={2.6} /></button>
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
+      {cats.map((c) => (
+        <section key={c} id={`sec-${c}`} className="menu-sec" data-cat={c}>
+          <div className="menu-sec-title"><span>{byCat(c)[0]?.emoji}</span>{c}<i /></div>
+          <div className="grid">
+            {byCat(c).map((p) => {
+              const q = qty(p.id);
+              return (
+                <button key={p.id} className={`tile ${q ? 'has' : ''} ${p.soldOut ? 'out' : ''}`} style={{ ['--c' as string]: CATEGORY_COLOR[p.category] ?? '#8c8178' }} {...tileHandlers(p)}>
+                  {q > 0 && <span className={`qty-badge ${bump === p.id ? 'bump' : ''}`}>{q}</span>}
+                  {q > 0 && <span className="minus" role="button" onClick={(e) => { e.stopPropagation(); removeOne(p.id); }}>−</span>}
+                  <span className="emoji" style={q ? { marginLeft: 30 } : undefined}>{p.emoji}</span>
+                  <span className="t-name">{p.short ?? p.name}</span>
+                  <span className="t-price">{p.soldOut ? 'Agotado' : money(p.price)}</span>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      ))}
+      <p className="center muted" style={{ fontSize: 13, padding: '18px 30px 0' }}>Mantén presionado un producto para agregar una nota (sin cebolla, salsas aparte…)</p>
 
       {count > 0 && (
-        <button className="cart-bar" onClick={() => { haptic.tap(); setCheckout(true); }}>
-          <span className="cart-count">{count}</span>
-          <span className="cart-label">{cart.channel === 'domicilio' ? 'Domicilio' : 'Mostrador'} · {plural(count, 'producto', 'productos')}</span>
-          <span className="cart-total">{money(subtotal)}</span>
-          <ChevronRight size={20} />
-        </button>
+        <div className="dock" ref={dockRef}>
+          <div className="dock-top">
+            <div className="dock-items">
+              {cart.items.map((i, k) => (
+                <button key={k} className="dock-item" onClick={() => removeOne(i.productId, i.note ?? '')}>
+                  <b>{i.qty}</b>{(products.find((p) => p.id === i.productId)?.short ?? i.name).slice(0, 18)}{i.note ? ' ✎' : ''}<span className="muted">✕</span>
+                </button>
+              ))}
+            </div>
+            <div className="dock-total">{money(total)}</div>
+            <button className="dock-clear" aria-label="Vaciar" onClick={() => { sfx.remove(); setCart(emptyCart(cart.channel)); }}>🗑</button>
+          </div>
+          <div className={`chan ${isDom ? 'dom' : ''}`}>
+            <div className="chan-thumb" />
+            <button className={!isDom ? 'on' : ''} onClick={() => { haptic.tap(); setCart({ ...cart, channel: 'mostrador' }); }}>🏪 Aquí / llevar</button>
+            <button className={isDom ? 'on' : ''} onClick={() => { haptic.tap(); setCart({ ...cart, channel: 'domicilio' }); }}>🛵 Domicilio</button>
+          </div>
+          {isDom && (
+            <button className={`cust-row ${needCustomer ? 'missing' : ''}`} onClick={() => setStep('customer')}>
+              <span style={{ fontSize: 18 }}>{needCustomer ? '📍' : '👤'}</span>
+              <span className="grow" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {needCustomer ? 'Toca para poner la dirección' : `${cart.customer.name || 'Cliente'} · ${cart.customer.address}`}
+              </span>
+              <span>›</span>
+            </button>
+          )}
+          <div className="pay-row">
+            <button className="pay cash" onClick={() => go('cash')}><span className="e">💵</span>{isDom ? 'Paga al recibir' : 'Efectivo'}</button>
+            <button className="pay transfer" onClick={() => go('transfer')}><span className="e">📲</span>Transferencia</button>
+            {!isDom && <button className="pay later" onClick={() => go('later')}><span className="e">⏳</span>Luego</button>}
+            {isDom && <button className="pay later" onClick={() => { if (needCustomer) return setStep('customer'); setStep('cash'); }}><span className="e">✓</span>Ya pagó</button>}
+          </div>
+        </div>
       )}
 
-      <Checkout
-        open={checkout}
-        cart={cart}
-        setCart={setCart}
-        onClose={() => setCheckout(false)}
-        onDone={(o) => {
-          setCheckout(false);
-          setCart({ channel: cart.channel, items: [] });
-          setDone(o);
-        }}
+      <NoteSheet product={noteFor} onClose={() => setNoteFor(null)} onAdd={(p, note, n) => { add(p, undefined, note, n); setNoteFor(null); }} />
+      <CashSheet open={step === 'cash'} total={total} onClose={() => setStep(null)} onPaid={(r) => finish('pagado', 'efectivo', undefined, r)} />
+      <TransferSheet open={step === 'transfer'} total={total} onClose={() => setStep(null)} onDone={(acc, arrived) => finish(arrived ? 'pagado' : 'pendiente', 'transferencia', acc)} />
+      <CustomerSheet
+        open={step === 'customer'}
+        value={cart.customer}
+        onChange={(customer) => setCart({ ...cart, customer })}
+        onClose={() => setStep(null)}
+        onPasteWhatsApp={() => { setStep(null); onPaste(); }}
       />
-      <DoneSheet order={done} onClose={() => setDone(null)} />
     </div>
   );
 }
 
-// ======================= Checkout (procedimiento guiado) =======================
-
-function Checkout({
-  open,
-  cart,
-  setCart,
-  onClose,
-  onDone,
-}: {
-  open: boolean;
-  cart: CartState;
-  setCart: (c: CartState) => void;
-  onClose: () => void;
-  onDone: (o: Order) => void;
-}) {
-  const s = useSettings();
-  const isDom = cart.channel === 'domicilio';
-  const [phone, setPhone] = useState('');
-  const [name, setName] = useState('');
-  const [address, setAddress] = useState('');
-  const [urgent, setUrgent] = useState(false);
-  const [fee, setFee] = useState<number | null>(null);
-  const [method, setMethod] = useState<PayMethod>('efectivo');
-  const [payStatus, setPayStatus] = useState<PayStatus | null>(null);
-  const [account, setAccount] = useState<string | undefined>();
-  const [received, setReceived] = useState(0);
-  const [noteFor, setNoteFor] = useState<number | null>(null);
-  const [saving, setSaving] = useState(false);
-
-  const deliveryFee = isDom ? (fee ?? s.defaultDeliveryFee) : 0;
-  const subtotal = cart.items.reduce((a, i) => a + i.qty * i.price, 0);
-  const total = subtotal + deliveryFee;
-  const status: PayStatus = payStatus ?? (isDom ? 'pendiente' : 'pagado');
-  const change = method === 'efectivo' && status === 'pagado' && received > 0 ? received - total : null;
-
-  const missing: string[] = [];
-  if (cart.items.length === 0) missing.push('agrega productos');
-  if (isDom && onlyDigits(phone).length < 7) missing.push('teléfono del cliente');
-  if (isDom && address.trim().length < 4) missing.push('dirección');
-  if (method === 'transferencia' && !account) missing.push('cuenta destino de la transferencia');
-  if (method === 'efectivo' && status === 'pagado' && received > 0 && received < total) missing.push('el efectivo recibido no alcanza');
-
-  const setQty = (idx: number, d: number) => {
-    haptic.tap();
-    const items = [...cart.items];
-    const q = items[idx].qty + d;
-    if (q <= 0) items.splice(idx, 1);
-    else items[idx] = { ...items[idx], qty: q };
-    setCart({ ...cart, items });
-  };
-  const setNote = (idx: number, note: string) => {
-    const items = [...cart.items];
-    items[idx] = { ...items[idx], note: note || undefined };
-    setCart({ ...cart, items });
-  };
-
-  const reset = () => {
-    setPhone(''); setName(''); setAddress(''); setUrgent(false); setFee(null);
-    setMethod('efectivo'); setPayStatus(null); setAccount(undefined); setReceived(0);
-  };
-
-  const confirm = async () => {
-    if (missing.length || saving) return;
-    setSaving(true);
-    try {
-      const o = await createOrder({
-        channel: cart.channel,
-        items: cart.items,
-        deliveryFee,
-        payStatus: status,
-        payMethod: method,
-        payAccount: method === 'transferencia' ? account : undefined,
-        cashReceived: method === 'efectivo' && status === 'pagado' && received ? received : undefined,
-        customer: isDom || name ? { name: name.trim() || undefined, phone: onlyDigits(phone) || undefined, address: address.trim() || undefined, urgent } : undefined,
-      });
-      haptic.success();
-      reset();
-      onDone(o);
-    } catch (e) {
-      toast('No se pudo guardar el pedido', 'warn');
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const bills = [total, 20000, 50000, 100000].filter((b, i, arr) => b >= total && arr.indexOf(b) === i);
-
+function NoteSheet({ product, onClose, onAdd }: { product: Product | null; onClose: () => void; onAdd: (p: Product, note: string | undefined, n: number) => void }) {
+  const [notes, setNotes] = useState<string[]>([]);
+  const [free, setFree] = useState('');
+  const [n, setN] = useState(1);
+  useEffect(() => { if (product) { setNotes([]); setFree(''); setN(1); } }, [product?.id]);
+  const note = [...notes, free.trim()].filter(Boolean).join(', ') || undefined;
   return (
-    <Sheet
-      open={open}
-      onClose={onClose}
-      full
-      title={isDom ? 'Pedido a domicilio' : 'Pedido en mostrador'}
-      subtitle={plural(cart.items.reduce((a, i) => a + i.qty, 0), 'producto', 'productos')}
-      footer={
-        <div className="checkout-foot">
-          {missing.length > 0 && <div className="missing">Falta: {missing.join(', ')}</div>}
-          <button className="btn btn-primary btn-block btn-xl" disabled={missing.length > 0 || saving} onClick={confirm}>
-            <Check size={20} strokeWidth={2.6} /> Confirmar pedido · {money(total)}
-          </button>
-        </div>
-      }
-    >
-      <div className="step"><span className="step-n">1</span>Revisa el pedido</div>
-      <div className="group">
-        {cart.items.map((it, idx) => (
-          <div key={idx} className="line">
-            <div className="line-main">
-              <div className="line-name">{it.name}</div>
-              {it.note ? (
-                <button className="line-note on" onClick={() => setNoteFor(noteFor === idx ? null : idx)}><StickyNote size={13} /> {it.note}</button>
-              ) : (
-                <button className="line-note" onClick={() => setNoteFor(noteFor === idx ? null : idx)}><StickyNote size={13} /> Nota</button>
-              )}
-              {noteFor === idx && (
-                <div className="note-editor">
-                  <div className="chips">
-                    {QUICK_NOTES.map((n) => (
-                      <button key={n} className={`chip sm ${it.note === n ? 'on' : ''}`} onClick={() => { setNote(idx, it.note === n ? '' : n); setNoteFor(null); }}>{n}</button>
-                    ))}
-                  </div>
-                  <input className="input sm" placeholder="Otra nota…" defaultValue={it.note ?? ''} onBlur={(e) => setNote(idx, e.target.value.trim())} />
-                </div>
-              )}
-            </div>
-            <div className="stepper">
-              <button onClick={() => setQty(idx, -1)} aria-label="Menos"><Minus size={16} strokeWidth={2.6} /></button>
-              <span>{it.qty}</span>
-              <button onClick={() => setQty(idx, +1)} aria-label="Más"><Plus size={16} strokeWidth={2.6} /></button>
-            </div>
-            <div className="line-total">{money(it.qty * it.price)}</div>
-          </div>
+    <Sheet open={!!product} onClose={onClose} title={product ? `${product.emoji} ${product.name}` : ''} sub={product?.description} footer={product && <button className="btn btn-go btn-block btn-xl" onClick={() => { burst('small'); onAdd(product, note, n); }}>Agregar {n} · {money(product.price * n)}</button>}>
+      <div className="row" style={{ justifyContent: 'space-between', marginBottom: 16 }}><span className="label">¿Cuántos?</span><Stepper value={n} min={1} onChange={setN} /></div>
+      <div className="label" style={{ marginBottom: 8 }}>Nota para la cocina</div>
+      <div className="chips" style={{ marginBottom: 12 }}>
+        {QUICK_NOTES.map((q) => (
+          <button key={q} className={`chip ${notes.includes(q) ? 'on' : ''}`} onClick={() => { haptic.tap(); setNotes(notes.includes(q) ? notes.filter((x) => x !== q) : [...notes, q]); }}>{q}</button>
         ))}
       </div>
-
-      <div className="step"><span className="step-n">2</span>{isDom ? 'Datos del cliente' : 'Cliente (opcional)'}</div>
-      <div className="group pad">
-        {isDom && (
-          <Field label="Celular / WhatsApp *">
-            <input className="input" inputMode="tel" placeholder="300 123 4567" value={phone} onChange={(e) => setPhone(e.target.value)} />
-          </Field>
-        )}
-        <Field label={isDom ? 'Nombre' : '¿A nombre de quién?'}>
-          <input className="input" placeholder={isDom ? 'Nombre del cliente' : 'Para llamarlo cuando esté listo'} value={name} onChange={(e) => setName(e.target.value)} />
-        </Field>
-        {isDom && (
-          <>
-            <Field label="Dirección *">
-              <input className="input" placeholder="Calle, número, barrio, indicaciones" value={address} onChange={(e) => setAddress(e.target.value)} />
-            </Field>
-            <div className="row-2">
-              <Field label="Urgencia">
-                <Segmented<'n' | 'u'> value={urgent ? 'u' : 'n'} onChange={(v) => setUrgent(v === 'u')} options={[{ value: 'n', label: 'Normal' }, { value: 'u', label: 'Urgente' }]} />
-              </Field>
-              <Field label="Valor domicilio">
-                <MoneyInput value={deliveryFee} onChange={(n) => setFee(n)} />
-              </Field>
-            </div>
-          </>
-        )}
-      </div>
-
-      <div className="step"><span className="step-n">3</span>Pago</div>
-      <div className="group pad">
-        <Segmented<PayMethod>
-          size="lg"
-          value={method}
-          onChange={(m) => { setMethod(m); setReceived(0); }}
-          options={[{ value: 'efectivo', label: '💵 Efectivo' }, { value: 'transferencia', label: '📲 Transferencia' }]}
-        />
-        {method === 'transferencia' && (
-          <Field label="¿A qué cuenta? *">
-            <Chips value={account} options={s.transferAccounts} onChange={setAccount} />
-          </Field>
-        )}
-        <Field label={method === 'transferencia' ? '¿Ya verificaste que llegó la plata?' : '¿Ya pagó?'}>
-          <Segmented<PayStatus>
-            value={status}
-            onChange={setPayStatus}
-            options={[
-              { value: 'pagado', label: method === 'transferencia' ? 'Sí, ya llegó' : 'Sí, pagó' },
-              { value: 'pendiente', label: isDom ? 'Paga al recibir' : 'Aún no' },
-            ]}
-          />
-        </Field>
-        {status === 'pendiente' && (
-          <div className="callout warn">La app va a insistir cada {s.reminderMinutes} min hasta que alguien confirme el pago.</div>
-        )}
-        {method === 'efectivo' && status === 'pagado' && (
-          <Field label="¿Con cuánto paga?">
-            <div className="bills">
-              {bills.map((b) => (
-                <button key={b} className={`chip ${received === b ? 'on' : ''}`} onClick={() => { haptic.tap(); setReceived(b); }}>
-                  {b === total ? 'Exacto' : money(b)}
-                </button>
-              ))}
-            </div>
-            <MoneyInput value={received} onChange={setReceived} placeholder="Otro valor" />
-            {change !== null && change >= 0 && (
-              <div className="change">Cambio: <b>{money(change)}</b></div>
-            )}
-          </Field>
-        )}
-      </div>
-
-      <div className="totals">
-        <div><span>Subtotal</span><span>{money(subtotal)}</span></div>
-        {isDom && <div><span>Domicilio</span><span>{money(deliveryFee)}</span></div>}
-        <div className="grand"><span>Total</span><span>{money(total)}</span></div>
-      </div>
-    </Sheet>
-  );
-}
-
-function DoneSheet({ order, onClose }: { order: Order | null; onClose: () => void }) {
-  const s = useSettings();
-  return (
-    <Sheet open={!!order} onClose={onClose}>
-      {order && (
-        <div className="done">
-          <div className="done-check"><Check size={40} strokeWidth={3} /></div>
-          <div className="done-title">Pedido #{order.number}</div>
-          <div className="done-sub">
-            {money(order.total)} · {order.payStatus === 'pagado' ? `Pagado (${order.payMethod})` : 'Pago pendiente'}
-          </div>
-          {order.cashReceived && order.cashReceived > order.total ? (
-            <div className="done-change">Entregar cambio: <b>{money(order.cashReceived - order.total)}</b></div>
-          ) : null}
-          {order.channel === 'domicilio' && order.customer?.phone && (
-            <button className="btn btn-wa btn-block" onClick={() => openWhatsApp(order.customer!.phone!, whatsappStatusText(order, s.businessName))}>
-              <MessageCircle size={18} /> Confirmar al cliente por WhatsApp
-            </button>
-          )}
-          <button className="btn btn-plain btn-block" onClick={onClose}>Nueva venta</button>
-        </div>
-      )}
+      <input className="input" placeholder="Otra nota…" value={free} onChange={(e) => setFree(e.target.value)} />
     </Sheet>
   );
 }

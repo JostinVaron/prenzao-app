@@ -1,0 +1,8 @@
+{
+  "name": "prenzao-relay",
+  "private": true,
+  "type": "module",
+  "description": "Relay Nostr mínimo y propio para Prenzao (corre en Termux, un PC o un VPS). Solo guarda datos cifrados.",
+  "scripts": { "start": "node server.mjs" },
+  "dependencies": { "nostr-tools": "^2.26.1", "ws": "^8.18.0" }
+}

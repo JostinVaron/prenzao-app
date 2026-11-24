@@ -1,7 +1,7 @@
 {
   "name": "prenzao-app",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Prenzao — app de operación del negocio (POS, pedidos, gastos, caja)",
   "scripts": {
@@ -14,6 +14,7 @@
     "apk": "npm run build:web && npx cap sync android && cd android && ./gradlew assembleRelease"
   },
   "dependencies": {
+    "@capacitor-community/text-to-speech": "^8.0.2",
     "@capacitor/android": "^8.6.2",
     "@capacitor/app": "^8.1.2",
     "@capacitor/core": "^8.6.2",
@@ -23,20 +24,29 @@
     "@capacitor/share": "^8.0.3",
     "@capacitor/splash-screen": "^8.0.2",
     "@capacitor/status-bar": "^8.0.4",
+    "@fontsource-variable/bricolage-grotesque": "^5.3.0",
     "@fontsource-variable/inter": "^5.3.0",
+    "canvas-confetti": "^1.9.4",
     "dexie": "^4.4.7",
     "dexie-react-hooks": "^4.4.0",
+    "jsqr": "^1.4.0",
     "lucide-react": "^1.79.0",
+    "nostr-tools": "^2.26.1",
+    "qrcode": "^1.5.4",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },
   "devDependencies": {
     "@capacitor/cli": "^8.6.2",
+    "@types/canvas-confetti": "^1.9.0",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "@types/ws": "^8.18.2",
     "@vitejs/plugin-react": "^6.3.0",
     "typescript": "^5.9.3",
     "vite": "^8.3.8",
-    "vite-plugin-pwa": "^2.0.0"
+    "vite-plugin-pwa": "^2.0.0",
+    "ws": "^8.23.0"
   }
 }
