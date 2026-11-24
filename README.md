@@ -33,7 +33,7 @@ Desde Termux en el S25 funciona directo (Node nativo, sin proot).
 ## Builds automáticos
 
 - `push` a `main` → **Actions → Android APK** genera el APK firmado (artefacto).
-- Tag `vX.Y.Z` → publica un **Release** con el APK.
+- Commit con `[release]` en el mensaje, o *Actions → Android APK → Run workflow* → publica un **Release** con el APK en `github.com/JostinVaron/prenzao-app/releases/latest`.
 - `push` a `main` → **PWA** se publica en la rama `gh-pages` → `https://jostinvaron.github.io/prenzao-app/`.
 
 ### Firma (una sola vez)

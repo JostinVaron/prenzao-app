@@ -1,7 +1,7 @@
 name: Android APK
 
-# Cada push a main compila un APK firmado.
-# Cada tag vX.Y.Z publica un Release descargable desde el celular.
+# Cada push a main compila un APK firmado (artefacto).
+# Publica un Release descargable si el commit dice [release] o si se lanza a mano (Run workflow).
 on:
   push:
     branches: [main]
@@ -38,7 +38,7 @@ jobs:
       - name: Versión
         run: |
           BASE=$(node -p "require('./package.json').version")
-          echo "PRENZAO_VERSION_NAME=${BASE}+${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
+          echo "PRENZAO_VERSION_NAME=${BASE}-build.${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
 
       - name: Dependencias
         run: npm ci
@@ -80,9 +80,13 @@ jobs:
           path: Prenzao-*.apk
           retention-days: 30
 
-      - name: Publicar Release (solo tags)
-        if: startsWith(github.ref, 'refs/tags/v') && steps.key.outputs.ok == 'true'
+      - name: Publicar Release
+        if: steps.key.outputs.ok == 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || contains(github.event.head_commit.message, '[release]'))
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ env.PRENZAO_VERSION_NAME }}
+          name: Prenzao ${{ env.PRENZAO_VERSION_NAME }}
+          target_commitish: ${{ github.sha }}
           files: Prenzao-*.apk
+          make_latest: true
           generate_release_notes: true
